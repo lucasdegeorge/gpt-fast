@@ -41,6 +41,7 @@ class ModelArgs:
 
     @classmethod
     def from_name(cls, name: str):
+        print("name: ", name)
         if name in transformer_configs:
             return cls(**transformer_configs[name])
         # fuzzy search
@@ -66,7 +67,9 @@ transformer_configs = {
     "stories15M": dict(n_layer=6, n_head=6, dim=288),
     "stories110M": dict(n_layer=12, n_head=12, dim=768),
     "Llama-3-8B": dict(block_size=8192, n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=128256),
-}
+    "TinyLlama-1.1B-Chat-v1.0": dict(n_layer=22, n_head=32 , dim=2048, intermediate_size=5632, vocab_size=32000),
+    "TinyLlama-1.1B-intermediate-step-1431k-3T": dict(block_size=2048, vocab_size=32000, intermediate_size=5632, n_layer=22, n_head=32, n_local_heads=4, dim=2048)   # (n_layer=22, n_head=32 , dim=2048, intermediate_size=5632, vocab_size=32000),
+}  
 
 class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
@@ -224,7 +227,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x: Tensor) -> Tensor:
-        output = self._norm(x.float()).type_as(x)
+        output = self._norm(x.float()).to(dtype=x.dtype)
         return output * self.weight
 
 
@@ -252,4 +255,4 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     )
 
     x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)
+    return x_out2.to(dtype=x.dtype)

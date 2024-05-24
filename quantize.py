@@ -15,6 +15,7 @@ try:
     from GPTQ import GenericGPTQRunner, InputRecorder
     from eval import get_task_dict, evaluate, lm_eval
 except:
+    print("Unable to import GPTQ and eval modules")
     pass
 
 from model import Transformer
