@@ -26,7 +26,7 @@ class ModelArgs:
     dim: int = 4096
     intermediate_size: int = None
     n_local_heads: int = -1
-    head_dim: int = 64
+    head_dim: int = None
     rope_base: float = 10000
     norm_eps: float = 1e-5
 
@@ -37,7 +37,8 @@ class ModelArgs:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
             self.intermediate_size = find_multiple(n_hidden, 256)
-        self.head_dim = self.dim // self.n_head
+        if self.head_dim is None:
+            self.head_dim = self.dim // self.n_head
 
     @classmethod
     def from_name(cls, name: str):
@@ -68,7 +69,9 @@ transformer_configs = {
     "stories110M": dict(n_layer=12, n_head=12, dim=768),
     "Llama-3-8B": dict(block_size=8192, n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=128256),
     "TinyLlama-1.1B-Chat-v1.0": dict(n_layer=22, n_head=32 , dim=2048, intermediate_size=5632, vocab_size=32000),
-    "TinyLlama-1.1B-intermediate-step-1431k-3T": dict(block_size=2048, vocab_size=32000, intermediate_size=5632, n_layer=22, n_head=32, n_local_heads=4, dim=2048)   # (n_layer=22, n_head=32 , dim=2048, intermediate_size=5632, vocab_size=32000),
+    "TinyLlama-1.1B-intermediate-step-1431k-3T": dict(block_size=2048, vocab_size=32000, intermediate_size=5632, n_layer=22, n_head=32, n_local_heads=4, dim=2048),   # (n_layer=22, n_head=32 , dim=2048, intermediate_size=5632, vocab_size=32000),
+    "gemma-2b": dict(dim=2048, vocab_size=256000, n_layer=18, n_head=8, n_local_heads=1, intermediate_size=16384),
+    "gemma-7b": dict(dim=3072, vocab_size=256000, n_layer=28, n_head=16, n_local_heads=16, intermediate_size=24576, head_dim=256),
 }  
 
 class KVCache(nn.Module):
@@ -107,7 +110,6 @@ class Transformer(nn.Module):
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
-        head_dim = self.config.dim // self.config.n_head
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
@@ -118,9 +120,9 @@ class Transformer(nn.Module):
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, self.config.head_dim)
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype)
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -128,6 +130,8 @@ class Transformer(nn.Module):
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
+        # for Gemma models 
+        x = (self.config.dim ** 0.5) * x
 
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
@@ -162,7 +166,7 @@ class Attention(nn.Module):
         total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
-        self.wo = nn.Linear(config.dim, config.dim, bias=False)
+        self.wo = nn.Linear(config.n_head * config.head_dim, config.dim, bias=False)
         self.kv_cache = None
 
         self.n_head = config.n_head
@@ -182,7 +186,7 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
-        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+        q, k, v = self.wqkv(x).split([self.n_head * self.head_dim, kv_size, kv_size], dim=-1)
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -200,7 +204,7 @@ class Attention(nn.Module):
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.n_head * self.head_dim)
 
         y = self.wo(y)
         return y
@@ -214,7 +218,9 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # for Gemma models
+        return self.w2(F.gelu(self.w1(x), approximate="tanh") * self.w3(x))
 
 
 class RMSNorm(nn.Module):
@@ -228,7 +234,9 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         output = self._norm(x.float()).to(dtype=x.dtype)
-        return output * self.weight
+        # return output * self.weight
+        # for Gemma models
+        return output * (1 + self.weight)
 
 
 def precompute_freqs_cis(
